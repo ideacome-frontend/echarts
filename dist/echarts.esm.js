@@ -36674,7 +36674,8 @@ barWidthAndOffset) {
 // `scale.setExtent` or `scale.unionExtentFromData`;
 
 
-function niceScaleExtent(scale, model) {
+function niceScaleExtent(scale, inModel) {
+  var model = inModel;
   var extentInfo = getScaleExtent(scale, model);
   var extent = extentInfo.extent;
   var splitNumber = model.get('splitNumber');
@@ -37239,6 +37240,7 @@ function makeRealNumberLabels(axis) {
   return {
     labels: map(ticks, function (tick, idx) {
       return {
+        level: tick.level,
         formattedLabel: labelFormatter(tick, idx),
         rawLabel: axis.scale.getLabel(tick),
         tickValue: tick.value
@@ -43000,8 +43002,60 @@ function turnPointsIntoStep(points, coordSys, stepTurnAt) {
   stepPoints.push(points[i++], points[i++]);
   return stepPoints;
 }
+/**
+ * Clip color stops to edge. Avoid creating too large gradients.
+ * Which may lead to blurry when GPU acceleration is enabled. See #15680
+ *
+ * The stops has been sorted from small to large.
+ */
 
-function getVisualGradient(data, coordSys) {
+
+function clipColorStops(colorStops, maxSize) {
+  var newColorStops = [];
+  var len = colorStops.length; // coord will always < 0 in prevOutOfRangeColorStop.
+
+  var prevOutOfRangeColorStop;
+  var prevInRangeColorStop;
+
+  function lerpStop(stop0, stop1, clippedCoord) {
+    var coord0 = stop0.coord;
+    var p = (clippedCoord - coord0) / (stop1.coord - coord0);
+    var color = lerp$1(p, [stop0.color, stop1.color]);
+    return {
+      coord: clippedCoord,
+      color: color
+    };
+  }
+
+  for (var i = 0; i < len; i++) {
+    var stop_1 = colorStops[i];
+    var coord = stop_1.coord;
+
+    if (coord < 0) {
+      prevOutOfRangeColorStop = stop_1;
+    } else if (coord > maxSize) {
+      if (prevInRangeColorStop) {
+        newColorStops.push(lerpStop(prevInRangeColorStop, stop_1, maxSize));
+      } // All following stop will be out of range. So just ignore them.
+
+
+      break;
+    } else {
+      if (prevOutOfRangeColorStop) {
+        newColorStops.push(lerpStop(prevOutOfRangeColorStop, stop_1, 0)); // Reset
+
+        prevOutOfRangeColorStop = null;
+      }
+
+      newColorStops.push(stop_1);
+      prevInRangeColorStop = stop_1;
+    }
+  }
+
+  return newColorStops;
+}
+
+function getVisualGradient(data, coordSys, api) {
   var visualMetaList = data.getVisual('visualMeta');
 
   if (!visualMetaList || !visualMetaList.length || !data.count()) {
@@ -43044,16 +43098,12 @@ function getVisualGradient(data, coordSys) {
   // LinearGradient to render `outerColors`.
 
 
-  var axis = coordSys.getAxis(coordDim);
-  var axisScaleExtent = axis.scale.getExtent(); // dataToCoord mapping may not be linear, but must be monotonic.
+  var axis = coordSys.getAxis(coordDim); // dataToCoord mapping may not be linear, but must be monotonic.
 
   var colorStops = map(visualMeta.stops, function (stop) {
-    var coord = axis.toGlobalCoord(axis.dataToCoord(stop.value)); // normalize the infinite value
-
-    isNaN(coord) || isFinite(coord) || (coord = axis.toGlobalCoord(axis.dataToCoord(axisScaleExtent[+(coord < 0)])));
+    // offset will be calculated later.
     return {
-      offset: 0,
-      coord: coord,
+      coord: axis.toGlobalCoord(axis.dataToCoord(stop.value)),
       color: stop.color
     };
   });
@@ -43065,32 +43115,37 @@ function getVisualGradient(data, coordSys) {
     outerColors.reverse();
   }
 
-  var tinyExtent = 10; // Arbitrary value: 10px
+  var colorStopsInRange = clipColorStops(colorStops, coordDim === 'x' ? api.getWidth() : api.getHeight());
+  var inRangeStopLen = colorStopsInRange.length;
 
-  var minCoord = colorStops[0].coord - tinyExtent;
-  var maxCoord = colorStops[stopLen - 1].coord + tinyExtent;
+  if (!inRangeStopLen && stopLen) {
+    // All stops are out of range. All will be the same color.
+    return colorStops[0].coord < 0 ? outerColors[1] ? outerColors[1] : colorStops[stopLen - 1].color : outerColors[0] ? outerColors[0] : colorStops[0].color;
+  }
+
+  var tinyExtent = 0; // Arbitrary value: 10px
+
+  var minCoord = colorStopsInRange[0].coord - tinyExtent;
+  var maxCoord = colorStopsInRange[inRangeStopLen - 1].coord + tinyExtent;
   var coordSpan = maxCoord - minCoord;
 
   if (coordSpan < 1e-3) {
     return 'transparent';
   }
 
-  each(colorStops, function (stop) {
+  each(colorStopsInRange, function (stop) {
     stop.offset = (stop.coord - minCoord) / coordSpan;
   });
-  colorStops.push({
-    offset: stopLen ? colorStops[stopLen - 1].offset : 0.5,
+  colorStopsInRange.push({
+    // NOTE: inRangeStopLen may still be 0 if stoplen is zero.
+    offset: inRangeStopLen ? colorStopsInRange[inRangeStopLen - 1].offset : 0.5,
     color: outerColors[1] || 'transparent'
   });
-  colorStops.unshift({
-    offset: stopLen ? colorStops[0].offset : 0.5,
+  colorStopsInRange.unshift({
+    offset: inRangeStopLen ? colorStopsInRange[0].offset : 0.5,
     color: outerColors[0] || 'transparent'
-  }); // zrUtil.each(colorStops, function (colorStop) {
-  //     // Make sure each offset has rounded px to avoid not sharp edge
-  //     colorStop.offset = (Math.round(colorStop.offset * (end - start) + start) - start) / (end - start);
-  // });
-
-  var gradient = new LinearGradient(0, 0, 0, 0, colorStops, true);
+  });
+  var gradient = new LinearGradient(0, 0, 0, 0, colorStopsInRange, true);
   gradient[coordDim] = minCoord;
   gradient[coordDim + '2'] = maxCoord;
   return gradient;
@@ -43365,7 +43420,7 @@ function (_super) {
     }
 
     this._clipShapeForSymbol = clipShapeForSymbol;
-    var visualColor = getVisualGradient(data, coordSys) || data.getVisual('style')[data.getVisual('drawType')]; // Initialization animation or coordinate system changed
+    var visualColor = getVisualGradient(data, coordSys, api) || data.getVisual('style')[data.getVisual('drawType')]; // Initialization animation or coordinate system changed
 
     if (!(polyline && prevCoordSys.type === coordSys.type && step === this._step)) {
       showSymbol && symbolDraw.updateData(data, {
@@ -43415,8 +43470,18 @@ function (_super) {
       } // Update clipPath
 
 
-      lineGroup.setClipPath(createLineClipPath(this, coordSys, false, seriesModel)); // Always update, or it is wrong in the case turning on legend
+      var oldClipPath = lineGroup.getClipPath();
+
+      if (oldClipPath) {
+        var newClipPath = createLineClipPath(this, coordSys, false, seriesModel);
+        initProps(oldClipPath, {
+          shape: newClipPath.shape
+        }, seriesModel);
+      } else {
+        lineGroup.setClipPath(createLineClipPath(this, coordSys, true, seriesModel));
+      } // Always update, or it is wrong in the case turning on legend
       // because points are not changed
+
 
       showSymbol && symbolDraw.updateData(data, {
         isIgnore: isIgnoreFunc,
@@ -45164,16 +45229,9 @@ var elementCreator = {
     return rect;
   },
   polar: function (seriesModel, data, newIndex, layout, isRadial, animationModel, axisModel, isUpdate, roundCap) {
-    // Keep the same logic with bar in catesion: use end value to control
-    // direction. Notice that if clockwise is true (by default), the sector
-    // will always draw clockwisely, no matter whether endAngle is greater
-    // or less than startAngle.
-    var clockwise = layout.startAngle < layout.endAngle;
     var ShapeClass = !isRadial && roundCap ? SausagePath : Sector;
     var sector = new ShapeClass({
-      shape: defaults({
-        clockwise: clockwise
-      }, layout),
+      shape: layout,
       z2: 1
     });
     sector.name = 'item';
@@ -45304,7 +45362,8 @@ var getLayout = {
       r0: layout.r0,
       r: layout.r,
       startAngle: layout.startAngle,
-      endAngle: layout.endAngle
+      endAngle: layout.endAngle,
+      clockwise: layout.clockwise
     };
   }
 };
@@ -48630,7 +48689,21 @@ var builders = {
     var ticksEls = buildAxisMajorTicks(group, transformGroup, axisModel, opt);
     var labelEls = buildAxisLabel(group, transformGroup, axisModel, opt);
     fixMinMaxLabelShow(axisModel, labelEls, ticksEls);
-    buildAxisMinorTicks(group, transformGroup, axisModel, opt.tickDirection);
+    buildAxisMinorTicks(group, transformGroup, axisModel, opt.tickDirection); // This bit fixes the label overlap issue for the time chart.
+    // See https://github.com/apache/echarts/issues/14266 for more.
+
+    if (axisModel.get(['axisLabel', 'hideOverlap'])) {
+      var labelList = prepareLayoutList(map(labelEls, function (label) {
+        return {
+          label: label,
+          priority: label.z2,
+          defaultAttr: {
+            ignore: label.ignore
+          }
+        };
+      }));
+      hideOverlap(labelList);
+    }
   },
   axisName: function (opt, axisModel, group, transformGroup) {
     var name = retrieve(opt.axisName, axisModel.get('name'));
@@ -48953,7 +49026,7 @@ function buildAxisLabel(group, transformGroup, axisModel, opt) {
       y: opt.labelOffset + opt.labelDirection * labelMargin,
       rotation: labelLayout.rotation,
       silent: silent,
-      z2: 10,
+      z2: 10 + (labelItem.level || 0),
       style: createTextStyle(itemLabelModel, {
         text: formattedLabel,
         align: itemLabelModel.getShallow('align', true) || labelLayout.textAlign,
@@ -70320,7 +70393,7 @@ function (_super) {
       children: option.data
     };
     completeTreeValue$1(root);
-    var levelModels = map(option.levels || [], function (levelDefine) {
+    var levelModels = this._levelModels = map(option.levels || [], function (levelDefine) {
       return new Model(levelDefine, this, ecModel);
     }, this); // Make sure always a new tree is created when setOption,
     // in TreemapView, we check whether oldTree === newTree
@@ -70354,6 +70427,10 @@ function (_super) {
     var node = this.getData().tree.getNodeByDataIndex(dataIndex);
     params.treePathInfo = wrapTreePathInfo(node, this);
     return params;
+  };
+
+  SunburstSeriesModel.prototype.getLevelModel = function (node) {
+    return this._levelModels && this._levelModels[node.depth];
   };
 
   SunburstSeriesModel.prototype.getViewRoot = function () {
@@ -70551,17 +70628,20 @@ function sunburstLayout(seriesType, ecModel, api) {
         var depth = node.depth - rootDepth - (renderRollupNode ? -1 : 1);
         var rStart = r0 + rPerLevel * depth;
         var rEnd = r0 + rPerLevel * (depth + 1);
-        var itemModel = node.getModel(); // @ts-ignore. TODO this is not provided to developer yet. Rename it.
+        var levelModel = seriesModel.getLevelModel(node);
 
-        if (itemModel.get('r0') != null) {
-          // @ts-ignore
-          rStart = parsePercent$1(itemModel.get('r0'), size / 2);
-        } // @ts-ignore
+        if (levelModel) {
+          var r0_1 = levelModel.get('r0', true);
+          var r_1 = levelModel.get('r', true);
+          var radius_1 = levelModel.get('radius', true);
 
+          if (radius_1 != null) {
+            r0_1 = radius_1[0];
+            r_1 = radius_1[1];
+          }
 
-        if (itemModel.get('r') != null) {
-          // @ts-ignore
-          rEnd = parsePercent$1(itemModel.get('r'), size / 2);
+          r0_1 != null && (rStart = parsePercent$1(r0_1, size / 2));
+          r_1 != null && (rEnd = parsePercent$1(r_1, size / 2));
         }
 
         node.setLayout({
@@ -75247,7 +75327,15 @@ function barLayoutPolar(seriesType, ecModel, api) {
         // Consider that positive angle is anti-clockwise,
         // while positive radian of sector is clockwise
         startAngle: -startAngle * Math.PI / 180,
-        endAngle: -endAngle * Math.PI / 180
+        endAngle: -endAngle * Math.PI / 180,
+
+        /**
+         * Keep the same logic with bar in catesion: use end value to
+         * control direction. Notice that if clockwise is true (by
+         * default), the sector will always draw clockwisely, no matter
+         * whether endAngle is greater or less than startAngle.
+         */
+        clockwise: startAngle >= endAngle
       });
     }
   });
@@ -81183,7 +81271,15 @@ function (_super) {
 
     this._initGlobalListener();
 
-    this._keepShow();
+    this._keepShow(); // PENDING
+    // `mousemove` event will be triggered very frequently when the mouse moves fast,
+    // which causes that the updatePosition was also called very frequently.
+    // In Chrome with devtools open and Firefox, tooltip looks lagged and shaked around. See #14695.
+    // To avoid the frequent triggering,
+    // consider throttling it in 50ms. (the tested result may need to validate)
+
+
+    this._updatePosition = this._renderMode === 'html' ? throttle(bind$2(this._doUpdatePosition, this), 50) : this._doUpdatePosition;
   };
 
   TooltipView.prototype._initGlobalListener = function () {
@@ -81691,7 +81787,7 @@ function (_super) {
     }
   };
 
-  TooltipView.prototype._updatePosition = function (tooltipModel, positionExpr, x, // Mouse x
+  TooltipView.prototype._doUpdatePosition = function (tooltipModel, positionExpr, x, // Mouse x
   y, // Mouse y
   content, params, el) {
     var viewWidth = this._api.getWidth();
@@ -84570,13 +84666,14 @@ coordSys, item) {
   // Alwalys return true if there is no coordSys
   return coordSys && coordSys.containData && item.coord && !hasXOrY(item) ? coordSys.containData(item.coord) : true;
 }
-function dimValueGetter(item, dimName, dataIndex, dimIndex) {
-  // x, y, radius, angle
-  if (dimIndex < 2) {
-    return item.coord && item.coord[dimIndex];
-  }
-
-  return item.value;
+function createMarkerDimValueGetter(inCoordSys, dims) {
+  return inCoordSys ? function (item, dimName, dataIndex, dimIndex) {
+    var rawVal = dimIndex < 2 // x, y, radius, angle
+    ? item.coord && item.coord[dimIndex] : item.value;
+    return parseDataValue(rawVal, dims[dimIndex]);
+  } : function (item, dimName, dataIndex, dimIndex) {
+    return parseDataValue(item.value, dims[dimIndex]);
+  };
 }
 function numCalculate(data, valueDataDim, type) {
   if (type === 'average') {
@@ -84813,9 +84910,8 @@ function createData(coordSys, seriesModel, mpModel) {
     dataOpt = filter(dataOpt, curry(dataFilter$1, coordSys));
   }
 
-  mpData.initData(dataOpt, null, coordSys ? dimValueGetter : function (item) {
-    return item.value;
-  });
+  var dimValueGetter = createMarkerDimValueGetter(!!coordSys, coordDimsInfos);
+  mpData.initData(dataOpt, null, dimValueGetter);
   return mpData;
 }
 
@@ -85210,15 +85306,13 @@ function createList$1(coordSys, seriesModel, mlModel) {
     optData = filter(optData, curry(markLineFilter, coordSys));
   }
 
-  var dimValueGetter$1 = coordSys ? dimValueGetter : function (item) {
-    return item.value;
-  };
+  var dimValueGetter = createMarkerDimValueGetter(!!coordSys, coordDimsInfos);
   fromData.initData(map(optData, function (item) {
     return item[0];
-  }), null, dimValueGetter$1);
+  }), null, dimValueGetter);
   toData.initData(map(optData, function (item) {
     return item[1];
-  }), null, dimValueGetter$1);
+  }), null, dimValueGetter);
   lineData.initData(map(optData, function (item) {
     return item[2];
   }));
@@ -85545,12 +85639,12 @@ function (_super) {
 }(MarkerView);
 
 function createList$2(coordSys, seriesModel, maModel) {
-  var coordDimsInfos;
   var areaData;
+  var dataDims;
   var dims = ['x0', 'y0', 'x1', 'y1'];
 
   if (coordSys) {
-    coordDimsInfos = map(coordSys && coordSys.dimensions, function (coordDim) {
+    var coordDimsInfos_1 = map(coordSys && coordSys.dimensions, function (coordDim) {
       var data = seriesModel.getData();
       var info = data.getDimensionInfo(data.mapDimension(coordDim)) || {}; // In map series data don't have lng and lat dimension. Fallback to same with coordSys
 
@@ -85560,18 +85654,19 @@ function createList$2(coordSys, seriesModel, maModel) {
         ordinalMeta: null
       });
     });
-    areaData = new SeriesData(map(dims, function (dim, idx) {
+    dataDims = map(dims, function (dim, idx) {
       return {
         name: dim,
-        type: coordDimsInfos[idx % 2].type
+        type: coordDimsInfos_1[idx % 2].type
       };
-    }), maModel);
+    });
+    areaData = new SeriesData(dataDims, maModel);
   } else {
-    coordDimsInfos = [{
+    dataDims = [{
       name: 'value',
       type: 'float'
     }];
-    areaData = new SeriesData(coordDimsInfos, maModel);
+    areaData = new SeriesData(dataDims, maModel);
   }
 
   var optData = map(maModel.get('data'), curry(markAreaTransform, seriesModel, coordSys, maModel));
@@ -85582,9 +85677,10 @@ function createList$2(coordSys, seriesModel, maModel) {
 
   var dimValueGetter = coordSys ? function (item, dimName, dataIndex, dimIndex) {
     // TODO should convert to ParsedValue?
-    return item.coord[Math.floor(dimIndex / 2)][dimIndex % 2];
-  } : function (item) {
-    return item.value;
+    var rawVal = item.coord[Math.floor(dimIndex / 2)][dimIndex % 2];
+    return parseDataValue(rawVal, dataDims[dimIndex]);
+  } : function (item, dimName, dataIndex, dimIndex) {
+    return parseDataValue(item.value, dataDims[dimIndex]);
   };
   areaData.initData(optData, null, dimValueGetter);
   areaData.hasItemOption = true;
